@@ -94,10 +94,11 @@ def _load_frame_for_rotation(
     repo_root: Path,
     camera_npz: Optional[Path],
     data_root: Path,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
-    Load one RGB frame and matching cam2world for calibration.
-    Prefer default MegaSAM export to match visualization scripts.
+    Load the reference RGB frame + matching cam2world for calibration, AND the full image stack
+    (for video gravity aggregation). Prefer default MegaSAM export to match visualization scripts.
+    Returns (ref_image, ref_cam_c2w, all_images_or_None).
     """
     scene_npz = repo_root / "results/output/scene" / f"{scene_name}_{hmr_type}_sgd_cvd_hr.npz"
 
@@ -118,7 +119,7 @@ def _load_frame_for_rotation(
             idx = 0
             if "valid_frame_indices" in data and len(data["valid_frame_indices"]) > 0:
                 idx = int(np.array(data["valid_frame_indices"]).ravel()[0])
-            return images[idx], cams[idx]
+            return images[idx], cams[idx], np.asarray(images)
         if cand.suffix == ".npy":
             camera_payload = np.load(cand, allow_pickle=True).item()
             cams = camera_payload.get("cam_c2w")
@@ -127,7 +128,7 @@ def _load_frame_for_rotation(
             image = _find_first_image(scene_name, data_root)
             if image is None:
                 raise FileNotFoundError(f"Could not find an image for {scene_name} under {data_root}.")
-            return image, cams[0]
+            return image, cams[0], None
 
     searched = "\n".join(str(c) for c in candidates)
     raise FileNotFoundError(
@@ -136,8 +137,18 @@ def _load_frame_for_rotation(
     )
 
 
+def _spherical_mean(vecs: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Weighted spherical mean of unit vectors (normalized sum)."""
+    if weights is not None:
+        weights = weights / weights.sum().clamp(min=1e-8)
+        mean = (vecs * weights.unsqueeze(-1)).sum(dim=0)
+    else:
+        mean = vecs.mean(dim=0)
+    return torch.nn.functional.normalize(mean, dim=-1)
+
+
 def get_calibration_roll_pitch(image: np.ndarray, device: str) -> Tuple[float, float]:
-    """Get roll and pitch calibration from an image using GeoCalib."""
+    """Roll/pitch from ONE image via GeoCalib (kept for the single-frame fallback path)."""
     from geocalib.utils import print_calibration
 
     model = GeoCalib().to(device)
@@ -149,6 +160,79 @@ def get_calibration_roll_pitch(image: np.ndarray, device: str) -> Tuple[float, f
     roll_rad = float(roll_rad.item())
     pitch_rad = float(pitch_rad.item())
     print_calibration(result)
+    return roll_rad, pitch_rad
+
+
+def get_video_calibration_roll_pitch(
+    images: np.ndarray,
+    device: str,
+    is_megasam: bool = True,
+    max_frames: int = 60,
+    mad_threshold: float = 3.0,
+) -> Tuple[float, float]:
+    """Roll/pitch aggregated over MANY frames (do-as-i-do's predict_video_gravity approach).
+
+    Runs GeoCalib per-frame, then aggregates the per-frame gravity unit vectors with a
+    confidence-weighted spherical mean after MAD-based outlier rejection. Far more robust than a
+    single frame for handheld / noisy / motion-blurred clips. Roll/pitch are read back from the
+    aggregated gravity vector so the downstream rotation math (pitch_rotm @ roll_rotm @ camR) is
+    unchanged. `images` is (N,H,W,3); for is_megasam the values are uint8 [0,255] and get /255.
+
+    Falls back to the single-frame estimate if 0 or 1 frames are usable.
+    """
+    from geocalib.gravity import Gravity
+
+    imgs = np.asarray(images)
+    if imgs.ndim == 3:  # single image -> single-frame path
+        return get_calibration_roll_pitch(
+            imgs.astype(np.float32) / 255.0 if is_megasam else imgs, device)
+    n = int(imgs.shape[0])
+    idxs = list(range(n))
+    if n > max_frames:  # uniform subsample to bound runtime
+        idxs = [int(round(t)) for t in np.linspace(0, n - 1, max_frames)]
+        idxs = sorted(set(idxs))
+
+    model = GeoCalib().to(device)
+    vecs, confs = [], []
+    with torch.no_grad():
+        for i in idxs:
+            frame = imgs[i]
+            if is_megasam:
+                frame = frame.astype(np.float32) / 255.0
+            inp = torch.tensor(frame, dtype=torch.float32).to(device).permute(2, 0, 1)
+            try:
+                res = model.calibrate(inp)
+            except Exception as exc:  # skip a bad frame, keep going
+                print(f"[gravity] frame {i}: calibrate failed ({exc}); skipping")
+                continue
+            vecs.append(res["gravity"].vec3d.squeeze(0).detach().cpu())
+            up_c = res["up_confidence"].mean().item() if "up_confidence" in res else 1.0
+            lat_c = res["latitude_confidence"].mean().item() if "latitude_confidence" in res else 1.0
+            confs.append(0.5 * (up_c + lat_c))
+
+    if len(vecs) <= 1:  # not enough for aggregation -> single-frame fallback
+        print("[gravity] <=1 usable frame; falling back to single-frame calibration")
+        f0 = imgs[idxs[0]].astype(np.float32) / 255.0 if is_megasam else imgs[idxs[0]]
+        return get_calibration_roll_pitch(f0, device)
+
+    V = torch.stack(vecs)                       # (M,3) per-frame gravity unit vectors
+    C = torch.tensor(confs, dtype=torch.float32)
+
+    # MAD outlier rejection on angular distance to the unweighted mean
+    mean0 = _spherical_mean(V)
+    ang = torch.acos((V * mean0.unsqueeze(0)).sum(-1).clamp(-1, 1))  # (M,)
+    med = ang.median()
+    mad = (ang - med).abs().median().clamp(min=1e-6)
+    inliers = ang <= (med + mad_threshold * mad)
+    if int(inliers.sum()) < 1:
+        inliers = torch.ones_like(ang, dtype=torch.bool)
+
+    final_vec = _spherical_mean(V[inliers], weights=C[inliers]).to(device)
+    grav = Gravity(final_vec.unsqueeze(0))
+    roll_rad, pitch_rad = grav.rp.unbind(-1)
+    roll_rad, pitch_rad = float(roll_rad.item()), float(pitch_rad.item())
+    print(f"[gravity] video-aggregated over {int(inliers.sum())}/{len(vecs)} inlier frames "
+          f"(of {n} total): roll={np.degrees(roll_rad):+.2f}deg pitch={np.degrees(pitch_rad):+.2f}deg")
     return roll_rad, pitch_rad
 
 
@@ -182,18 +266,28 @@ def get_world_alignment_from_image(
     cam_raw: np.ndarray,
     device: str,
     is_megasam: bool = True,
+    all_images: Optional[np.ndarray] = None,
+    video_gravity: bool = True,
 ) -> np.ndarray:
     """
     Returns only:
       world_rotation: (3,3) alignment rotation
 
     IMPORTANT: NO camera translation is returned/used.
-    """
-    img = rgb
-    if is_megasam:
-        img = img.astype(np.float32) / 255.0
 
-    roll, pitch = get_calibration_roll_pitch(img, device)
+    If `all_images` (N,H,W,3) is given and video_gravity is True, gravity is estimated by
+    aggregating GeoCalib over all frames (confidence-weighted spherical mean + MAD rejection);
+    otherwise it falls back to the single `rgb` frame. The aggregated gravity is composed with the
+    REFERENCE frame's camR (same frame the caller paired cam_raw with), so the rotation math is
+    unchanged -- valid because these are static-camera clips (camR constant across frames).
+    """
+    if video_gravity and all_images is not None and np.asarray(all_images).ndim == 4:
+        roll, pitch = get_video_calibration_roll_pitch(all_images, device, is_megasam=is_megasam)
+    else:
+        img = rgb
+        if is_megasam:
+            img = img.astype(np.float32) / 255.0
+        roll, pitch = get_calibration_roll_pitch(img, device)
 
     pitch_rotm = np.array(
         [[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]],
@@ -223,16 +317,22 @@ def compute_world_alignment(
     camera_npz: Optional[Path],
     data_root: Path,
     is_megasam: bool = True,
+    video_gravity: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
       T_align: (4,4) with rotation filled (translation filled later by shared ground shift)
       world_rotation: (3,3)
+
+    video_gravity=True aggregates gravity over all scene frames (robust); False uses one frame.
     """
-    rgb_img, cam_raw = _load_frame_for_rotation(scene_name, hmr_type, repo_root, camera_npz, data_root)
+    rgb_img, cam_raw, all_images = _load_frame_for_rotation(
+        scene_name, hmr_type, repo_root, camera_npz, data_root)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    world_rotation = get_world_alignment_from_image(rgb_img, cam_raw, device, is_megasam)
+    world_rotation = get_world_alignment_from_image(
+        rgb_img, cam_raw, device, is_megasam,
+        all_images=all_images, video_gravity=video_gravity)
 
     T_align = np.eye(4, dtype=np.float32)
     T_align[:3, :3] = world_rotation
@@ -987,6 +1087,8 @@ def process_sequence(
     floor_lowest_percent: float,
     floor_abs_threshold: float,
     num_joints: int,
+    video_gravity: bool = True,
+    recompute_gravity: bool = False,
 ) -> None:
     repo_root = REPO_ROOT
     seq_input_root = input_root / seq_name / hmr_type
@@ -1003,11 +1105,12 @@ def process_sequence(
 
     # 1) rotation
     cached_world_rotation = seq_output_root / "world_rotation.npy"
-    if cached_world_rotation.exists():
+    if cached_world_rotation.exists() and not recompute_gravity:
         world_rotation = np.load(cached_world_rotation).astype(np.float32)
         T_align = np.eye(4, dtype=np.float32)
         T_align[:3, :3] = world_rotation
-        print(f"[OK] Reusing cached world rotation: {cached_world_rotation}")
+        print(f"[OK] Reusing cached world rotation: {cached_world_rotation} "
+              f"(pass --recompute-gravity to re-run GeoCalib)")
     else:
         T_align, world_rotation = compute_world_alignment(
             scene_name=seq_name,
@@ -1016,6 +1119,7 @@ def process_sequence(
             camera_npz=None,
             data_root=data_root,
             is_megasam=is_megasam,
+            video_gravity=video_gravity,
         )
 
     # 2) scene rotate+ground (shared translation)
@@ -1216,6 +1320,13 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--camera-npz", type=Path, default=None, help="Optional explicit camera NPZ (ignored by default pipeline).")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT, help="Dataset root used to locate reference images.")
     parser.add_argument("--no-megasam", action="store_true", help="Disable MegaSAM-specific image normalization.")
+    parser.add_argument("--no-video-gravity", action="store_true",
+                        help="Estimate gravity from ONE frame instead of aggregating GeoCalib over all "
+                             "scene frames (confidence-weighted spherical mean + MAD). Aggregation is the "
+                             "default and is more robust for handheld/noisy clips.")
+    parser.add_argument("--recompute-gravity", action="store_true",
+                        help="Re-run GeoCalib even if a cached world_rotation.npy exists (needed to "
+                             "pick up the video-gravity estimate on sequences already processed).")
     parser.add_argument("--debug-stride", type=int, default=10, help="Stride for dumping visualization OBJ meshes.")
     parser.add_argument("--export-motion-root", type=Path, default=None, help="Destination root for motion npz export.")
     parser.add_argument("--export-urdf-root", type=Path, default=None, help="Destination root for URDF/mesh export.")
@@ -1335,6 +1446,8 @@ def main(argv: Optional[Sequence[str]] = None):
             floor_lowest_percent=args.floor_lowest_percent,
             floor_abs_threshold=args.floor_abs_threshold,
             num_joints=args.num_joints,
+            video_gravity=not args.no_video_gravity,
+            recompute_gravity=args.recompute_gravity,
         )
 
 
