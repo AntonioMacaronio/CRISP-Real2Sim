@@ -14,7 +14,14 @@ HMR_TYPE="gv"
 
 bash 1_video2imgs.sh "$ROOT_DIR"
 bash 2_get_mask.sh "$ROOT_DIR"
-bash 3_megasam.sh "$ROOT_DIR" 
+# Depth+camera backend: VGGT-Omega is the DEFAULT (more accurate depth than MegaSAM on our exocentric
+# clips). Set DEPTH_BACKEND=megasam to fall back. Both write the same raw_mega_priors/<seq>.npz
+# contract; stages 4/6/7 are unchanged.
+if [ "${DEPTH_BACKEND:-vggt}" = "megasam" ]; then
+  bash 3_megasam.sh "$ROOT_DIR"
+else
+  bash 3_vggt_omega.sh "$ROOT_DIR"
+fi
 bash 4_post_camera.sh "$ROOT_DIR"
 bash 5_grav.sh "$ROOT_DIR"
 bash 0_ufm.sh "$ROOT_DIR"
