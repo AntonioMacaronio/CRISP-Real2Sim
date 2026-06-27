@@ -1359,8 +1359,11 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument(
         "--post-opt-z-offset",
         type=float,
-        default=0.2,
-        help="Extra global z offset applied after penetration optimization.",
+        default=0.05,
+        help="Extra global z offset (m) applied to the human after penetration optimization. Was 0.2 "
+             "(lifted the human ~20cm above the floor -> visible float); reduced to 0.05 so feet sit "
+             "~on the floor (penetration opt already pushes feet up out of the scene; this is just a "
+             "small clearance).",
     )
     parser.add_argument(
         "--no-extra-read-ours-opt",
